@@ -1,0 +1,149 @@
+# ── prod environment — api.kortix.com on ECS Fargate (autoscaled, HA) ─────────
+#
+#   api.kortix.com → Cloudflare (proxied, Full strict) → ALB → ECS Fargate
+#   service (autoscaled on CPU/memory, min 2 tasks across 2 AZs) in private
+#   subnets, egress via per-AZ NAT.
+#
+# SAME modules as dev (../dev) — prod just runs bigger numbers, no Spot, a NAT
+# per AZ, and Container Insights on. min_capacity=2 across AZs gives the
+# availability + horizontal autoscaling expected for SOC 2. Not applied
+# automatically. See README.md.
+
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = ">= 4.0, < 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+provider "cloudflare" {
+  # Auth precedence (mirrors ../dev): scoped API token → global API key
+  # (email + key) → format-valid dummy token (so an apply with no CF creds, e.g.
+  # plan-only, doesn't reject an empty token). DNS/ACM validation needs real creds.
+  api_token = var.cloudflare_api_token != "" ? var.cloudflare_api_token : (var.cloudflare_api_key != "" ? null : "0000000000000000000000000000000000000000")
+  email     = var.cloudflare_api_key != "" ? var.cloudflare_email : null
+  api_key   = var.cloudflare_api_key != "" ? var.cloudflare_api_key : null
+}
+
+locals {
+  name   = "kortix-prod"
+  domain = var.api_domain
+  # Cloudflare record name = the subdomain label(s) before the zone apex. For
+  # "new-api.kortix.com" → "new-api"; for "api.kortix.com" → "api". (Single-label
+  # subdomain on the kortix.com zone, which is all we use here.)
+  dns_record_name = replace(var.api_domain, ".kortix.com", "")
+  tags = {
+    Environment = "prod"
+    Service     = "kortix-api"
+    ManagedBy   = "terraform"
+  }
+}
+
+module "network" {
+  source             = "../../modules/network"
+  name               = local.name
+  cidr               = "10.20.0.0/16"
+  az_count           = 2
+  single_nat_gateway = false # prod: NAT per AZ for HA
+  tags               = local.tags
+}
+
+module "acm" {
+  source                    = "../../modules/acm-cloudflare"
+  domain_name               = local.domain
+  subject_alternative_names = var.extra_api_hostnames
+  zone_id                   = var.cloudflare_zone_id
+  tags                      = local.tags
+  providers = {
+    aws        = aws
+    cloudflare = cloudflare
+  }
+}
+
+module "api" {
+  source     = "../../modules/ecs-api"
+  name       = local.name
+  aws_region = var.aws_region
+
+  vpc_id             = module.network.vpc_id
+  public_subnet_ids  = module.network.public_subnet_ids
+  private_subnet_ids = module.network.private_subnet_ids
+
+  image           = var.api_image
+  container_port  = var.container_port
+  enable_https    = true
+  certificate_arn = module.acm.certificate_arn
+  environment     = var.api_environment
+  secrets         = var.api_secrets
+
+  # prod sizing: bigger tasks, HA floor of 2, no spot, insights on
+  task_cpu           = 1024
+  task_memory        = 2048
+  desired_count      = 2
+  min_capacity       = 2
+  max_capacity       = 10
+  use_fargate_spot   = false
+  container_insights = true
+  cpu_target         = 55
+  memory_target      = 65
+  # Load-proportional scaling. CPU/mem alone left the service flat during the
+  # 2026-06-08 DB-contention incident. ~200 req/min/target is normal and peaks
+  # ~256; 600 only scales out on a genuine sustained surge (no flapping). Tune
+  # down once steady-state per-target load is confirmed. NOTE: the incident was
+  # slow-operation-driven, not load-driven, so this is general resilience, not
+  # the primary fix (that's the DB pool + statement_timeout in app code).
+  requests_per_target_target = 600
+  tags                       = local.tags
+}
+
+# DNS for the public API hostname. Gated by manage_dns so the stack (VPC/ALB/
+# ECS/cert) can be built and validated WITHOUT touching the live api.kortix.com
+# record — the cutover (repoint api.kortix.com → this ALB) is done deliberately
+# once the new stack is verified against the prod DB, and is instantly
+# reversible. ACM validation records (in module.acm) are unique and always created.
+module "dns" {
+  source  = "../../modules/cloudflare-dns"
+  count   = var.manage_dns ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+
+  records = {
+    api = {
+      name    = local.dns_record_name
+      type    = "CNAME"
+      value   = module.api.alb_dns_name
+      proxied = true
+      ttl     = 1
+    }
+  }
+}
+
+# Extra public API hostnames → the ALB. Used to expose the new stack under an
+# UNLOCKED hostname (e.g. api-prod.kortix.com) while the canonical
+# api.kortix.com record stays tunnel-locked on the old box. Each is a proxied
+# CNAME and is covered by the cert via var.extra_api_hostnames (the ACM SANs).
+module "dns_extra" {
+  source  = "../../modules/cloudflare-dns"
+  count   = length(var.extra_api_hostnames) > 0 ? 1 : 0
+  zone_id = var.cloudflare_zone_id
+
+  records = {
+    for h in var.extra_api_hostnames : replace(h, ".kortix.com", "") => {
+      name    = replace(h, ".kortix.com", "")
+      type    = "CNAME"
+      value   = module.api.alb_dns_name
+      proxied = true
+      ttl     = 1
+    }
+  }
+}

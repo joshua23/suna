@@ -1,0 +1,188 @@
+name: Promote to Production
+
+# Review-gated promotion — PROPOSE only; publishing happens on merge.
+#
+# This workflow never publishes anything. It:
+#   1. computes the NEXT version from what's currently live on `prod`,
+#   2. freezes the promoted code (the source ref, default `main`) on an
+#      ephemeral `release/vX.Y.Z` branch, stamping `VERSION` + `RELEASE_NOTES.md`,
+#   3. opens a PR into the protected `prod` branch.
+#
+# No tag, no GitHub Release, no image retag, no deploy, and `main` is untouched.
+# A second person reviews and MERGES the PR — that merge is the ONLY thing that
+# advances `prod`, and its push event triggers deploy-prod.yml, which is what
+# actually creates the tag `vX.Y.Z`, cuts the Release, and deploys. So a version
+# only ever comes into existence when code lands on `prod`. `main` (dev) stays
+# push-friendly; the review gate lives entirely at the prod boundary.
+#
+# The release branch does a `merge -s ours origin/prod` so `prod` is always an
+# ancestor of the PR head → the promote PR merges cleanly every time (no VERSION
+# / notes conflicts), while keeping the promoted ref's content verbatim.
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: 'Release title — one-liner for the public changelog'
+        required: true
+        type: string
+      notes:
+        description: 'Release notes — what changed and why (markdown ok)'
+        required: true
+        type: string
+      bump:
+        description: 'Semver bump (ignored if an explicit version is given)'
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+      version:
+        description: 'Explicit version override (e.g. 0.9.1) — optional'
+        required: false
+        type: string
+      ref:
+        description: 'Source ref to promote (default main)'
+        required: false
+        default: main
+        type: string
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-release-pr:
+    name: Open review-gated release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ${{ inputs.ref }} (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Compute next version (from what's live on prod)
+        id: ver
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin prod >/dev/null 2>&1 || true
+          # Source of truth for "what's released" = VERSION on prod. Falls back
+          # to the ref's VERSION only if prod has none (first-ever release).
+          BASE="$(git show origin/prod:VERSION 2>/dev/null | tr -d '[:space:]' || true)"
+          [ -n "$BASE" ] || BASE="$(tr -d '[:space:]' < VERSION)"
+          echo "Currently live on prod: $BASE"
+
+          EXPLICIT="${{ inputs.version }}"
+          if [ -n "$EXPLICIT" ]; then
+            NEW="${EXPLICIT#v}"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+            : "${MAJOR:=0}"; : "${MINOR:=0}"; : "${PATCH:=0}"
+            case "${{ inputs.bump }}" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+            NEW="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          echo "$NEW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "Computed version '$NEW' is not X.Y.Z" >&2; exit 1; }
+
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          echo "Proposing v$NEW"
+
+      - name: Pre-flight — refuse to promote unless this commit is fully green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "Promote source ${{ inputs.ref }} @ $SHA"
+          # Every check-run on this commit must be completed + success (skipped /
+          # neutral OK). Crucially this INCLUDES deploy-dev, which builds the
+          # :dev-<sha8> image that deploy-prod retags — so an all-green commit
+          # guarantees that image exists. This blocks the race where prod retags a
+          # stale :dev-latest because the new dev image hadn't finished building.
+          # Robustly judge greenness, tolerating two GitHub quirks that would
+          # otherwise make this gate un-passable:
+          #   1. THIS promote run registers an in_progress check on HEAD (and a
+          #      failed earlier attempt leaves a `failure` one) — exclude any
+          #      check-run belonging to our own github.run_id.
+          #   2. Re-runs / concurrency leave SUPERSEDED duplicate check-runs of
+          #      the same name (e.g. a `cancelled` CodeQL "Analyze" next to a
+          #      later `success`). Keep only the latest run per name (max
+          #      started_at) so a stale cancelled/failed attempt can't block.
+          NOT_GREEN="$(RID="${{ github.run_id }}" gh api "repos/${{ github.repository }}/commits/$SHA/check-runs?per_page=100" --paginate \
+            --jq '[ .check_runs[]
+                    | select((.details_url // "") | contains("/runs/" + env.RID + "/") | not) ]
+                  | group_by(.name) | map(max_by(.started_at // ""))
+                  | .[]
+                  | select((.status != "completed") or (((.conclusion // "") | IN("success","skipped","neutral")) | not))
+                  | "\(.name): \(.status)/\(.conclusion)"' || true)"
+          if [ -n "$NOT_GREEN" ]; then
+            echo "::error::Refusing to promote — $SHA is not all-green (this includes the dev image build):"
+            echo "$NOT_GREEN"
+            echo "Wait for these to finish/pass on '${{ inputs.ref }}', then re-run promote." >&2
+            exit 1
+          fi
+          echo "✓ All checks green on $SHA — safe to promote."
+
+      - name: Freeze release branch + open PR into prod
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TITLE: ${{ inputs.title }}
+          IN_NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.ver.outputs.new }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          RELBR="release/$TAG"
+          # The commit being promoted (the source ref's HEAD, BEFORE we branch +
+          # merge prod). deploy-prod pins the dev image to this exact SHA.
+          SRC_SHA="$(git rev-parse HEAD)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Branch off the promoted ref, then record prod as a merged ancestor
+          # WITHOUT taking its content (`-s ours`). This guarantees the PR into
+          # prod is a clean fast-forward-able merge — no VERSION/notes conflicts,
+          # ever — while the tree stays exactly the promoted ref's content.
+          git checkout -B "$RELBR"
+          git merge -s ours --no-edit origin/prod -m "chore(release): supersede prod with $TAG" || true
+
+          # Stamp the clean version + carry the human release entry as a committed
+          # file. deploy-prod.yml reads these AFTER the merge to publish — nothing
+          # is published here.
+          printf '%s\n' "$NEW" > VERSION
+          printf '%s\n\n%s\n' "$IN_TITLE" "$IN_NOTES" > RELEASE_NOTES.md
+          printf '%s\n' "$SRC_SHA" > RELEASE_SOURCE_SHA
+          git add VERSION RELEASE_NOTES.md RELEASE_SOURCE_SHA
+          git commit -m "release: $TAG"
+          git push -f origin "HEAD:refs/heads/$RELBR"
+
+          existing="$(gh pr list --base prod --head "$RELBR" --state open --json number --jq '.[0].number' || true)"
+          if [ -n "$existing" ]; then
+            echo "Release PR #$existing already open for $RELBR."
+          else
+            printf '%s\n\n%s\n\n---\n_Merging this PR **publishes %s**: tags it, cuts the GitHub Release, retags images, rolls the prod ECS service, and deploys the prod frontend. Nothing is published until this merges._\n' \
+              "$IN_TITLE" "$IN_NOTES" "$TAG" \
+              | gh pr create --base prod --head "$RELBR" --title "Release $TAG — $IN_TITLE" --body-file -
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release PR opened — \`${{ steps.ver.outputs.tag }}\`"
+            echo ""
+            echo "- Live on prod: \`${{ steps.ver.outputs.base }}\`"
+            echo "- Proposed version: \`${{ steps.ver.outputs.new }}\`"
+            echo "- \`${{ inputs.ref }}\` → \`release/${{ steps.ver.outputs.tag }}\` → PR into \`prod\`"
+            echo ""
+            echo "_Nothing is published yet. A reviewer approves + merges the PR; the **merge** publishes the version (tag + GitHub Release + image retag + ECS roll + frontend)._"
+          } >> "$GITHUB_STEP_SUMMARY"

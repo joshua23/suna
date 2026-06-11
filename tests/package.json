@@ -1,0 +1,26 @@
+{
+  "name": "@kortix/tests",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "ke2e — Kortix end-to-end REST API test suite (black-box, live services, one source of truth)",
+  "bin": {
+    "ke2e": "bin/ke2e.ts"
+  },
+  "scripts": {
+    "ke2e": "bun bin/ke2e.ts",
+    "e2e": "bun bin/ke2e.ts run",
+    "coverage": "bun bin/ke2e.ts coverage",
+    "gc": "bun bin/ke2e.ts gc",
+    "report": "bun bin/ke2e.ts report",
+    "list": "bun bin/ke2e.ts list",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}
