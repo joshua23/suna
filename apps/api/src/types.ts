@@ -1,0 +1,344 @@
+import { z } from 'zod';
+
+// === Request Schemas (Router) === 
+
+export const WebSearchRequestSchema = z.object({
+  query: z.string().min(1, 'Query is required'),
+  max_results: z.number().int().min(1).max(10).default(5),
+  search_depth: z.enum(['basic', 'advanced']).default('basic'),
+  session_id: z.string().optional(),
+});
+
+export type WebSearchRequest = z.infer<typeof WebSearchRequestSchema>;
+
+export const ImageSearchRequestSchema = z.object({
+  query: z.string().min(1, 'Query is required'),
+  max_results: z.number().int().min(1).max(20).default(5),
+  safe_search: z.boolean().default(true),
+  session_id: z.string().optional(),
+});
+
+export type ImageSearchRequest = z.infer<typeof ImageSearchRequestSchema>;
+
+// === Response Types (Router) ===
+
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  published_date: string | null;
+}
+
+export interface WebSearchResponse {
+  results: WebSearchResult[];
+  query: string;
+  cost: number;
+}
+
+export interface ImageSearchResult {
+  title: string;
+  url: string;
+  thumbnail_url: string;
+  source_url: string;
+  width: number | null;
+  height: number | null;
+}
+
+export interface ImageSearchResponse {
+  results: ImageSearchResult[];
+  query: string;
+  cost: number;
+}
+
+// === Billing Types (Router billing service) ===
+
+export interface BillingCheckResult {
+  hasCredits: boolean;
+  message: string;
+  balance: number | null;
+}
+
+export interface BillingDeductResult {
+  success: boolean;
+  cost: number;
+  newBalance: number;
+  skipped?: boolean;
+  reason?: string;
+  transactionId?: string;
+  error?: string;
+}
+
+// === Context Types ===
+
+export interface AppContext {
+  accountId: string;
+  sandboxId?: string;
+  keyId?: string;
+}
+
+// Context variables set by auth middleware (platform).
+// Single source of truth for everything apiKeyAuth / supabaseAuth / combinedAuth
+// write onto the Hono context — keep this in sync with middleware/auth.ts.
+export interface AuthVariables {
+  userId: string;
+  userEmail: string;
+  accountId?: string;
+  authType?: 'supabase' | 'pat' | 'apiKey';
+  apiKeyType?: 'user' | 'sandbox';
+  keyId?: string;
+  sandboxId?: string;
+  /** Set for project-scoped CLI PATs — enforced against the URL :projectId. */
+  tokenProjectId?: string;
+  /** PAT token identity for the IAM engine (token-as-principal evaluation). */
+  iamTokenId?: string;
+}
+
+// Hono environment type — Variables match exactly what the auth middleware sets.
+export type AppEnv = {
+  Variables: AuthVariables;
+};
+
+// ─── Tier System (Billing) ──────────────────────────────────────────────────
+
+export interface TierConfig {
+  name: string;
+  displayName: string;
+  monthlyPrice: number;
+  yearlyPrice: number;
+  monthlyCredits: number;
+  canPurchaseCredits: boolean;
+  models: string[];
+  dailyCreditConfig: DailyCreditConfig | null;
+  hidden: boolean;
+  /** Max concurrent project sessions allowed for accounts on this tier. */
+  concurrentSessionLimit: number;
+}
+
+export interface DailyCreditConfig {
+  dailyAmount: number;
+  refreshIntervalHours: number;
+  maxAccumulation: number;
+}
+
+// ─── Credit Accounts (Billing) ──────────────────────────────────────────────
+
+export interface CreditAccount {
+  id: string;
+  accountId: string;
+  balance: number;
+  expiringCredits: number;
+  nonExpiringCredits: number;
+  dailyCreditsBalance: number;
+  tier: string;
+  provider: string;
+  stripeSubscriptionId: string | null;
+  stripeSubscriptionStatus: string | null;
+  planType: string | null;
+  billingCycleAnchor: string | null;
+  nextCreditGrant: string | null;
+  lastGrantDate: string | null;
+  lastDailyRefresh: string | null;
+  trialStatus: string | null;
+  trialEndsAt: string | null;
+  commitmentType: string | null;
+  commitmentEndDate: string | null;
+  scheduledTierChange: string | null;
+  scheduledTierChangeDate: string | null;
+  scheduledPriceId: string | null;
+  lastProcessedInvoiceId: string | null;
+  lastRenewalPeriodStart: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─── Billing Customers ──────────────────────────────────────────────────────
+
+export interface BillingCustomer {
+  id: string;
+  accountId: string;
+  stripeCustomerId: string;
+  email: string | null;
+  name: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─── Account State (API response) ───────────────────────────────────────────
+
+export interface AccountStateResponse {
+  credits: {
+    total: number;
+    daily: number;
+    monthly: number;
+    extra: number;
+    can_run: boolean;
+    daily_refresh: {
+      enabled: boolean;
+      daily_amount: number;
+      refresh_interval_hours: number;
+      last_refresh: string | null;
+      next_refresh_at: string | null;
+      seconds_until_refresh: number | null;
+    } | null;
+  };
+  subscription: {
+    tier_key: string;
+    tier_display_name: string;
+    status: string;
+    billing_period: 'monthly' | 'yearly' | 'yearly_commitment' | null;
+    provider: 'stripe' | 'revenuecat' | 'local';
+    subscription_id: string | null;
+    current_period_end: number | null;
+    cancel_at_period_end: boolean;
+    is_cancelled: boolean;
+    cancellation_effective_date: string | null;
+    has_scheduled_change: boolean;
+    scheduled_change: ScheduledChange | null;
+    commitment: CommitmentInfo;
+    can_purchase_credits: boolean;
+  };
+  tier: {
+    name: string;
+    display_name: string;
+    monthly_credits: number;
+    can_purchase_credits: boolean;
+  };
+  /** @deprecated Model gates moved into provider configuration and sandbox model discovery. */
+  models: ModelInfo[];
+  auto_topup: {
+    enabled: boolean;
+    threshold: number;
+    amount: number;
+  };
+  instances: Array<{
+    sandbox_id: string;
+    external_id: string | null;
+    name: string;
+    provider: string;
+    status: string;
+    server_type: string | null;
+    location: string | null;
+    error_message?: string | null;
+    is_included: boolean;
+    stripe_subscription_item_id: string | null;
+    created_at: string;
+  }>;
+  can_add_instances: boolean;
+  /** True when a legacy paid user has no active machine and can claim one. */
+  can_claim_computer?: boolean;
+  /** True only for genuine legacy per-machine accounts with a machine to migrate
+   *  to per-seat — gates the "Claim seat-based pricing" card so new per-seat-era
+   *  users never see a no-op claim. */
+  can_claim_per_seat?: boolean;
+
+  // Billing v2 — surfaced for per-seat accounts only. Legacy accounts get
+  // billing_model='legacy' here and the frontend renders the legacy UI.
+  billing_model: 'legacy' | 'per_seat';
+  seats?: {
+    count: number;
+    price_per_seat_usd: number;
+    /** Pricing-page transparency only — not a wallet partition. */
+    typical_compute_budget_per_seat_usd: number;
+    /** Pricing-page transparency only — not a wallet partition. */
+    typical_llm_budget_per_seat_usd: number;
+  };
+  /**
+   * Spend breakdown by category for the current billing period. Sourced from
+   * credit_ledger aggregation, not from a partitioned wallet. Null for legacy
+   * accounts.
+   */
+  usage_this_period?: {
+    compute_usd: number;
+    llm_usd: number;
+    total_usd: number;
+    period_start: string | null;
+    period_end: string | null;
+  } | null;
+  /**
+   * Account-level resource limits + current usage. The `concurrent_sessions`
+   * field surfaces the same cap the API enforces at session-create time
+   * (see shared/account-limits.ts).
+   */
+  limits?: {
+    concurrent_sessions: {
+      active: number;
+      limit: number;
+    };
+  };
+}
+
+export interface ScheduledChange {
+  type: 'downgrade';
+  current_tier: { name: string; display_name: string; monthly_credits?: number };
+  target_tier: { name: string; display_name: string; monthly_credits?: number };
+  effective_date: string;
+}
+
+export interface CommitmentInfo {
+  has_commitment: boolean;
+  can_cancel: boolean;
+  commitment_type: string | null;
+  months_remaining: number | null;
+  commitment_end_date: string | null;
+}
+
+/** @deprecated Legacy model gating — models are now configured in-sandbox via LLM Providers. */
+export interface ModelInfo {
+  id: string;
+  name: string;
+  provider: string;
+  allowed: boolean;
+  context_window: number;
+  capabilities: string[];
+  priority: number;
+}
+
+// ─── API Request/Response Types (Billing) ───────────────────────────────────
+
+export interface CreateCheckoutRequest {
+  tier_key: string;
+  success_url: string;
+  cancel_url: string;
+  commitment_type?: 'monthly' | 'yearly' | 'yearly_commitment';
+  locale?: string;
+  referral_id?: string;
+}
+
+export interface CreateInlineCheckoutRequest {
+  tier_key: string;
+  billing_period: 'monthly' | 'yearly';
+  promo_code?: string;
+}
+
+export interface CreatePortalRequest {
+  return_url: string;
+}
+
+export interface PurchaseCreditsRequest {
+  amount: number;
+  success_url: string;
+  cancel_url: string;
+}
+
+export interface CancelSubscriptionRequest {
+  feedback?: string;
+}
+
+export interface ScheduleDowngradeRequest {
+  target_tier_key: string;
+  commitment_type?: 'monthly' | 'yearly' | 'yearly_commitment';
+}
+
+export interface TokenUsageRequest {
+  prompt_tokens: number;
+  completion_tokens: number;
+  model: string;
+}
+
+export interface DeductResult {
+  success: boolean;
+  cost: number;
+  new_balance: number;
+  transaction_id?: string;
+  error?: string;
+}
